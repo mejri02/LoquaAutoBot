@@ -49,6 +49,37 @@ npm install chromium
 # Windows: Download from https://www.chromium.org/getting-involved/download-chromium
 ```
 
+**If Chrome/Chromium is not found automatically:**
+
+Find your Chromium/Chrome path:
+
+```bash
+# Linux
+which chromium
+which chromium-browser
+which google-chrome
+
+# macOS
+/Applications/Chromium.app/Contents/MacOS/Chromium
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome
+
+# Windows
+where chrome
+C:\Program Files\Google\Chrome\Application\chrome.exe
+```
+
+Then edit `index.js` and replace the `findChrome()` result:
+
+```javascript
+// In index.js, find this line (~line 90):
+const chromePath = findChrome();
+
+// Replace with your path:
+const chromePath = '/usr/bin/chromium'; // Linux example
+const chromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'; // macOS example
+const chromePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'; // Windows example
+```
+
 **Required packages:**
 - `puppeteer-core` — Browser automation (lightweight, no bundled Chromium)
 - `chromium` — Chromium browser binary (or use system Chrome)
