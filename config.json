@@ -1,0 +1,19 @@
+{
+    "headless": true,
+    "checkInInterval": 86400,
+    "minMessagesPerAccount": 8,
+    "maxMessagesPerAccount": 12,
+    "delayBetweenMessagesMin": 60,
+    "delayBetweenMessagesMax": 180,
+    "delayBetweenAccountsMin": 30,
+    "delayBetweenAccountsMax": 60,
+    "sleepAfterCycleSeconds": 14400,
+    "maxMessagesPerTenMinutes": 5,
+    "messages": [
+        "Just read about Sui's new zkLogin feature – huge for onboarding! 🔐",
+        "The Sui ecosystem is expanding fast. Any favorite new projects?",
+        "DeFi on Sui is getting interesting – DeepBook volume is up 40% this week.",
+        "NFTs on Sui are underrated. The Move language enables some really cool dynamic assets.",
+        "I think we'll see major institutional adoption of Sui in the next bull run."
+    ]
+}
