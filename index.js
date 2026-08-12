@@ -15,6 +15,11 @@ let CONFIG = {
     delayBetweenAccountsMax: 60,
     sleepAfterCycleSeconds: 14400,
     maxMessagesPerTenMinutes: 5,
+    groqChance: 0.4,
+    groqModels: [
+        'llama-3.1-8b-instant',
+        'llama-3.2-3b-preview'
+    ],
     messages: [
         "Just read about Sui's new zkLogin feature – huge for onboarding! 🔐",
         "The Sui ecosystem is expanding fast. Any favorite new projects?",
@@ -28,6 +33,36 @@ let CONFIG = {
         "Building on Sui feels so smooth – the dev experience is top-notch."
     ]
 };
+
+let GROQ_API_KEYS = [];
+let currentKeyIndex = 0;
+let currentModelIndex = 0;
+
+try {
+    const content = fs.readFileSync('groq.txt', 'utf8');
+    GROQ_API_KEYS = content.split(/[\s\n]+/).filter(k => k.trim().startsWith('gsk_')).map(k => k.trim());
+    if (GROQ_API_KEYS.length > 0) {
+        console.log(`✅ Loaded ${GROQ_API_KEYS.length} Groq API keys`);
+        GROQ_API_KEYS = GROQ_API_KEYS.sort(() => Math.random() - 0.5);
+    } else {
+        console.log('⚠️ No valid Groq API keys found in groq.txt');
+    }
+} catch {
+    console.log('ℹ️ No groq.txt found, Groq AI disabled');
+}
+
+function getNextGroqKey() {
+    if (GROQ_API_KEYS.length === 0) return null;
+    const key = GROQ_API_KEYS[currentKeyIndex];
+    currentKeyIndex = (currentKeyIndex + 1) % GROQ_API_KEYS.length;
+    return key;
+}
+
+function getNextGroqModel() {
+    const model = CONFIG.groqModels[currentModelIndex];
+    currentModelIndex = (currentModelIndex + 1) % CONFIG.groqModels.length;
+    return model;
+}
 
 try {
     const cfg = JSON.parse(fs.readFileSync('config.json', 'utf8'));
@@ -108,7 +143,7 @@ function printBanner() {
     console.log(clr('bCyan', '║') + clr('bYellow', '  ███████╗╚██████╔╝██████╔╝╚██████╔╝██║  ██║') + clr('bCyan', '║'));
     console.log(clr('bCyan', '║') + clr('bYellow', '  ╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝') + clr('bCyan', '║'));
     console.log(clr('bCyan', '╠' + '═'.repeat(w) + '╣'));
-    const sub = '  🤖  LOQUA BOT  ·  PUPPETEER  ·  v5.1  ';
+    const sub = `  🤖  LOQUA BOT  ·  v5.4  `;
     console.log(clr('bCyan', '║') + clr('bMagenta', sub.padEnd(w)) + clr('bCyan', '║'));
     console.log(clr('bCyan', '╚' + '═'.repeat(w) + '╝') + '\n');
 }
@@ -146,14 +181,151 @@ function loadAccounts() {
     return accounts;
 }
 
-function extractEmail(idToken) {
+function isTokenExpired(account) {
+    if (!account.session.loquaAuth?.expires_at) return true;
     try {
-        if (!idToken) return null;
-        const parts = idToken.split('.');
-        if (parts.length !== 3) return null;
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-        return payload.email || null;
-    } catch { return null; }
+        const expiresAt = Date.parse(account.session.loquaAuth.expires_at);
+        return !Number.isFinite(expiresAt) || expiresAt <= Date.now() + 300000;
+    } catch {
+        return true;
+    }
+}
+
+async function refreshToken(account) {
+    try {
+        console.log(ts() + ' 🔄 ' + clr('bYellow', `Refreshing token for ${account.address.slice(0,10)}...`));
+        const refreshToken = account.session.loquaAuth.refresh_token;
+        if (!refreshToken) throw new Error('No refresh token available');
+        const response = await fetch('https://api.loqua.net/auth/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${refreshToken}` },
+            body: JSON.stringify({ refresh_token: refreshToken })
+        });
+        if (!response.ok) throw new Error(`Refresh failed with status ${response.status}`);
+        const data = await response.json();
+        if (!data.access_token) throw new Error('No access_token in refresh response');
+        account.session.loquaAuth.access_token = data.access_token;
+        account.session.loquaAuth.expires_at = data.expires_at || data.expiresAt;
+        if (data.refresh_token) account.session.loquaAuth.refresh_token = data.refresh_token;
+        account.session.expiresAt = Date.parse(data.expires_at || data.expiresAt) || Date.now() + 86400000;
+        const accountsData = JSON.parse(fs.readFileSync('accounts.json', 'utf8'));
+        const accountIndex = accountsData.findIndex(a => a.address === account.address);
+        if (accountIndex !== -1) {
+            accountsData[accountIndex] = account.session;
+            fs.writeFileSync('accounts.json', JSON.stringify(accountsData, null, 2));
+        }
+        console.log(ts() + ' ✅ ' + clr('bGreen', `Token refreshed for ${account.address.slice(0,10)}`));
+        return true;
+    } catch (error) {
+        console.log(ts() + ' ❌ ' + clr('bRed', `Token refresh failed: ${error.message}`));
+        return false;
+    }
+}
+
+async function attemptReLogin(account) {
+    try {
+        console.log(ts() + ' 🔑 ' + clr('bYellow', `Attempting re-login for ${account.address.slice(0,10)}...`));
+        const { authMessage, authSignature, address } = account.session;
+        if (!authMessage || !authSignature) throw new Error('No auth data for re-login');
+        const response = await fetch('https://api.loqua.net/auth/wallet/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address, message: authMessage, signature: authSignature })
+        });
+        if (!response.ok) throw new Error(`Re-login failed with status ${response.status}`);
+        const data = await response.json();
+        if (!data.access_token) throw new Error('No access_token in re-login response');
+        account.session.loquaAuth = data;
+        account.session.expiresAt = Date.parse(data.expires_at) || Date.now() + 86400000;
+        account.session.authMessage = authMessage;
+        account.session.authSignature = authSignature;
+        const accountsData = JSON.parse(fs.readFileSync('accounts.json', 'utf8'));
+        const accountIndex = accountsData.findIndex(a => a.address === account.address);
+        if (accountIndex !== -1) {
+            accountsData[accountIndex] = account.session;
+            fs.writeFileSync('accounts.json', JSON.stringify(accountsData, null, 2));
+        }
+        console.log(ts() + ' ✅ ' + clr('bGreen', `Re-login successful for ${account.address.slice(0,10)}`));
+        return true;
+    } catch (error) {
+        console.log(ts() + ' ❌ ' + clr('bRed', `Re-login failed: ${error.message}`));
+        return false;
+    }
+}
+
+async function ensureValidSession(account) {
+    if (!account.session.loquaAuth?.access_token) {
+        console.log(ts() + ' ⚠️ ' + clr('bYellow', `No token for ${account.address.slice(0,10)}`));
+        return false;
+    }
+    if (isTokenExpired(account)) {
+        let refreshed = await refreshToken(account);
+        if (!refreshed) refreshed = await attemptReLogin(account);
+        if (!refreshed) {
+            console.log(ts() + ' ❌ ' + clr('bRed', `Cannot refresh session for ${account.address.slice(0,10)}`));
+            return false;
+        }
+    }
+    return true;
+}
+
+async function getGroqReply(messages) {
+    if (GROQ_API_KEYS.length === 0) return null;
+    const maxAttempts = GROQ_API_KEYS.length * CONFIG.groqModels.length;
+    let attempts = 0;
+    while (attempts < maxAttempts) {
+        const apiKey = getNextGroqKey();
+        const model = getNextGroqModel();
+        attempts++;
+        try {
+            const chatContext = messages.slice(-5).map(m => ({
+                role: 'user',
+                content: m.text || m.bodyPreview || ''
+            })).filter(m => m.content.length > 0);
+            if (chatContext.length === 0) return null;
+            const systemPrompt = `You are a knowledgeable crypto enthusiast participating in the Loqua Global Chat on the Sui blockchain. Keep responses short (1-2 sentences), conversational, and relevant to Sui, DeFi, NFTs, or Web3. Be positive and engaging. Never mention you're an AI.`;
+            const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        ...chatContext.slice(-3),
+                        { role: 'user', content: 'Reply to the latest messages in the chat naturally.' }
+                    ],
+                    max_tokens: 60,
+                    temperature: 0.8
+                })
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Groq API error: ${response.status} - ${errorText}`);
+            }
+            const data = await response.json();
+            const reply = data.choices?.[0]?.message?.content?.trim();
+            if (reply && reply.length > 5 && reply.length < 200) {
+                console.log(ts() + ' 🤖 ' + clr('bGreen', `Groq AI reply (${model})`));
+                return reply;
+            }
+            continue;
+        } catch (error) {
+            console.log(ts() + ' ⚠️ ' + clr('bYellow', `Groq ${model} failed: ${error.message}, trying next...`));
+        }
+    }
+    console.log(ts() + ' ❌ ' + clr('bRed', `All Groq keys and models failed`));
+    return null;
+}
+
+async function getMessage(account, chatMessages = []) {
+    if (GROQ_API_KEYS.length === 0) {
+        return CONFIG.messages[Math.floor(Math.random() * CONFIG.messages.length)];
+    }
+    if (Math.random() < CONFIG.groqChance && chatMessages.length > 0) {
+        const aiReply = await getGroqReply(chatMessages);
+        if (aiReply) return aiReply;
+    }
+    return CONFIG.messages[Math.floor(Math.random() * CONFIG.messages.length)];
 }
 
 class LoquaBot {
@@ -186,7 +358,6 @@ class LoquaBot {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            // FIX: Disable web security to allow CORS requests to Sui fullnode
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-site-isolation-trials',
@@ -217,21 +388,8 @@ class LoquaBot {
             '--no-default-browser-check',
             '--no-first-run',
             '--disable-background-networking',
-            '--disable-client-side-phishing-detection',
-            '--safebrowsing-disable-auto-update',
-            '--disable-accelerated-2d-canvas',
-            '--disable-accelerated-jpeg-decoding',
-            '--disable-accelerated-mjpeg-decode',
-            '--disable-accelerated-video-decode',
-            '--disable-accelerated-video-encode',
-            '--disable-gpu-compositing',
-            '--disable-gpu-sandbox',
-            '--disable-gpu-watchdog',
-            '--disable-software-rasterizer',
-            '--disable-webgl',
-            '--disable-webgl2'
+            '--safebrowsing-disable-auto-update'
         ];
-        
         const proxy = this.useProxy ? this.getNextProxy() : null;
         if (proxy) {
             const agent = getProxyAgent(proxy);
@@ -246,7 +404,6 @@ class LoquaBot {
             console.error('❌ Chrome not found!');
             process.exit(1);
         }
-        
         try {
             this.browser = await puppeteer.launch({
                 headless: CONFIG.headless ? 'new' : false,
@@ -254,37 +411,26 @@ class LoquaBot {
                 args: this.getBrowserArgs(),
                 defaultViewport: { width: 1280, height: 720 },
                 timeout: 60000,
-                ignoreHTTPSErrors: true,
-                dumpio: false
+                ignoreHTTPSErrors: true
             });
             this.page = await this.browser.newPage();
-            
-            // Set extra headers to avoid CORS issues
             await this.page.setExtraHTTPHeaders({
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache'
             });
-            
             await this.page.setUserAgent(getNextUserAgent());
-            
-            // Set viewport
             await this.page.setViewport({ width: 1280, height: 720 });
-            
-            // Enable request interception to handle CORS
             await this.page.setRequestInterception(true);
-            
             this.page.on('request', (request) => {
                 const resourceType = request.resourceType();
-                // Allow all resources except images/fonts to speed up loading
                 if (resourceType === 'image' || resourceType === 'font' || resourceType === 'media') {
                     request.abort();
                 } else {
                     request.continue();
                 }
             });
-            
             console.log('✅ Browser initialized with CORS bypass enabled');
         } catch (error) {
             console.error('❌ Failed to initialize browser:', error.message);
@@ -294,11 +440,7 @@ class LoquaBot {
 
     async closeBrowser() {
         if (this.browser) {
-            try {
-                await this.browser.close();
-            } catch (e) {
-                // Ignore close errors
-            }
+            try { await this.browser.close(); } catch (e) {}
             this.browser = null;
             this.page = null;
         }
@@ -306,49 +448,20 @@ class LoquaBot {
 
     async injectSession(session) {
         if (!this.page) await this.initBrowser();
-        
         try {
-            // Navigate with longer timeout and wait for network idle
-            await this.page.goto('https://loqua.net', { 
-                waitUntil: 'networkidle2', 
-                timeout: 60000,
-                referer: 'https://loqua.net/'
-            });
-            
-            // Wait for page to be ready
+            await this.page.goto('https://loqua.net', { waitUntil: 'networkidle2', timeout: 60000, referer: 'https://loqua.net/' });
             await this.page.waitForFunction(() => document.readyState === 'complete', { timeout: 30000 });
-            
-            // Inject session
             await this.page.evaluate((s) => {
                 localStorage.setItem('loqua.zklogin.session', JSON.stringify(s));
             }, session);
-            
-            // Reload with longer timeout
-            await this.page.reload({ 
-                waitUntil: 'networkidle2', 
-                timeout: 60000 
-            });
-            
-            // Wait for page to stabilize
+            await this.page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
             await sleep(5000);
-            
-            // Check if page loaded correctly
-            const pageLoaded = await this.page.evaluate(() => {
-                return document.querySelector('body') !== null;
-            });
-            
-            if (!pageLoaded) {
-                throw new Error('Page failed to load properly');
-            }
-            
+            const pageLoaded = await this.page.evaluate(() => document.querySelector('body') !== null);
+            if (!pageLoaded) throw new Error('Page failed to load properly');
             return true;
         } catch (error) {
             console.log(ts() + ' ❌ ' + clr('bRed', `Navigation failed: ${error.message}`));
-            // Take screenshot on failure
-            try {
-                await this.page.screenshot({ path: 'error-screenshot.png' });
-                console.log(ts() + ' 📸 ' + clr('bYellow', 'Error screenshot saved: error-screenshot.png'));
-            } catch (e) {}
+            try { await this.page.screenshot({ path: 'error-screenshot.png' }); } catch (e) {}
             throw error;
         }
     }
@@ -363,7 +476,6 @@ class LoquaBot {
             'textarea.web-chat-input',
             'textarea[aria-label*="message"]'
         ];
-        
         for (const selector of selectors) {
             try {
                 await this.page.waitForSelector(selector, { timeout: 5000 });
@@ -376,11 +488,7 @@ class LoquaBot {
 
     async waitForChatToLoad() {
         try {
-            // Wait for chat to be visible
-            await this.page.waitForSelector('.web-chat-list, .web-chat-input', { 
-                timeout: 60000,
-                visible: true 
-            });
+            await this.page.waitForSelector('.web-chat-list, .web-chat-input', { timeout: 60000, visible: true });
             return true;
         } catch (error) {
             console.log(ts() + ' ❌ ' + clr('bRed', 'Chat failed to load'));
@@ -388,27 +496,39 @@ class LoquaBot {
         }
     }
 
+    async getChatMessages() {
+        try {
+            const messages = await this.page.evaluate(() => {
+                const items = document.querySelectorAll('.web-chat-row');
+                return Array.from(items).slice(-5).map(el => {
+                    const text = el.querySelector('.web-chat-text')?.textContent || '';
+                    const sender = el.querySelector('strong')?.textContent || '';
+                    return { text, sender };
+                });
+            });
+            return messages.filter(m => m.text.length > 0);
+        } catch { return []; }
+    }
+
     async dailyCheckIn(account) {
         try {
+            const isValid = await ensureValidSession(account);
+            if (!isValid) {
+                console.log(ts() + ' ❌ ' + clr('bRed', `Session invalid for ${account.address.slice(0,10)}`));
+                return false;
+            }
             console.log(ts() + ' 📋 ' + clr('bBlue', `Check-in ${account.address.slice(0,10)}...`));
-            
-            // First inject session
             await this.injectSession(account.session);
-            
-            // Wait for chat to load
             const chatLoaded = await this.waitForChatToLoad();
             if (!chatLoaded) {
                 console.log(ts() + ' ❌ ' + clr('bRed', 'Chat not loaded after waiting'));
                 return false;
             }
-            
-            // Find the input field
             const input = await this.findInput();
             if (!input) {
                 console.log(ts() + ' ❌ ' + clr('bRed', 'Chat input not found'));
                 return false;
             }
-            
             account.lastCheckIn = Date.now();
             console.log(ts() + ' ✅ ' + clr('bGreen', 'Check-in successful!'));
             return true;
@@ -424,58 +544,44 @@ class LoquaBot {
             console.log(ts() + ' ⏳ ' + clr('bYellow', `Rate limited for ${remaining}s`));
             return false;
         }
-        
         if (Date.now() - account.windowStartTime > CONFIG.maxMessagesPerTenMinutes * 60 * 1000) {
             account.messagesInWindow = 0;
             account.windowStartTime = Date.now();
         }
-        
         if (account.messagesInWindow >= CONFIG.maxMessagesPerTenMinutes) {
             account.rateLimitedUntil = Date.now() + 600 * 1000;
             console.log(ts() + ' ⏳ ' + clr('bYellow', 'Rate limit reached'));
             return false;
         }
-
         try {
-            const msg = CONFIG.messages[Math.floor(Math.random() * CONFIG.messages.length)];
+            const isValid = await ensureValidSession(account);
+            if (!isValid) {
+                console.log(ts() + ' ❌ ' + clr('bRed', `Session invalid for ${account.address.slice(0,10)}`));
+                return false;
+            }
+            const chatContext = await this.getChatMessages();
+            const msg = await getMessage(account, chatContext);
             console.log(ts() + ' 💬 ' + clr('bCyan', `${account.address.slice(0,10)}: `) + clr('bWhite', `"${msg}"`));
-            
-            // Inject session and navigate
             await this.injectSession(account.session);
-            
-            // Wait for chat to load
             const chatLoaded = await this.waitForChatToLoad();
             if (!chatLoaded) {
                 console.log(ts() + ' ❌ ' + clr('bRed', 'Chat not loaded'));
                 return false;
             }
-            
             const input = await this.findInput();
             if (!input) {
                 console.log(ts() + ' ❌ ' + clr('bRed', 'Chat input not found'));
                 return false;
             }
-            
-            // Click and focus on input
             await this.page.evaluate((selector) => {
                 const el = document.querySelector(selector);
-                if (el) { 
-                    el.focus(); 
-                    el.click();
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
+                if (el) { el.focus(); el.click(); el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
             }, input);
-            
             await sleep(1000);
-            
-            // Type message with human-like delay
             await this.page.type(input, msg, { delay: 30 + Math.random() * 40 });
             await sleep(500 + Math.random() * 1000);
-            
-            // Press Enter with delay
             await this.page.keyboard.press('Enter');
             await sleep(3000);
-            
             account.messageCount++;
             account.messagesInWindow++;
             console.log(ts() + ' ✅ ' + clr('bGreen', 'Message sent!'));
@@ -483,13 +589,7 @@ class LoquaBot {
             return true;
         } catch (error) {
             console.log(ts() + ' ❌ ' + clr('bRed', `Send failed: ${error.message}`));
-            
-            // Take screenshot on failure
-            try {
-                await this.page.screenshot({ path: 'error-screenshot.png' });
-                console.log(ts() + ' 📸 ' + clr('bYellow', 'Error screenshot saved: error-screenshot.png'));
-            } catch (e) {}
-            
+            try { await this.page.screenshot({ path: 'error-screenshot.png' }); } catch (e) {}
             return false;
         }
     }
@@ -498,9 +598,15 @@ class LoquaBot {
         for (let i = 0; i < this.accounts.length && this.running; i++) {
             const account = this.accounts[i];
             let accountFailed = false;
-            
             try {
-                // Check-in
+                if (isTokenExpired(account)) {
+                    console.log(ts() + ' 🔄 ' + clr('bYellow', `Token expired for ${account.address.slice(0,10)}, refreshing...`));
+                    const refreshed = await ensureValidSession(account);
+                    if (!refreshed) {
+                        console.log(ts() + ' ⚠️ ' + clr('bYellow', `Cannot refresh ${account.address.slice(0,10)}, skipping`));
+                        continue;
+                    }
+                }
                 if (!account.lastCheckIn || (Date.now() - account.lastCheckIn >= CONFIG.checkInInterval * 1000)) {
                     const checkInSuccess = await this.dailyCheckIn(account);
                     if (!checkInSuccess) {
@@ -508,12 +614,9 @@ class LoquaBot {
                         console.log(ts() + ' ⚠️ ' + clr('bYellow', `Account ${account.address.slice(0,10)} check-in failed, skipping messages`));
                     }
                 }
-                
-                // Only send messages if check-in succeeded or was already done
                 if (!accountFailed) {
                     const count = Math.floor(Math.random() * (CONFIG.maxMessagesPerAccount - CONFIG.minMessagesPerAccount + 1)) + CONFIG.minMessagesPerAccount;
                     let sent = 0;
-                    
                     for (let j = 0; j < count && this.running; j++) {
                         if (account.rateLimitedUntil > Date.now()) break;
                         const success = await this.sendMessage(account);
@@ -525,23 +628,16 @@ class LoquaBot {
                         }
                     }
                 }
-                
-                // Account switching delay
                 if (i < this.accounts.length - 1 && this.running) {
                     const accDelay = Math.floor(Math.random() * (CONFIG.delayBetweenAccountsMax - CONFIG.delayBetweenAccountsMin + 1)) + CONFIG.delayBetweenAccountsMin;
                     console.log(ts() + ' 🔄 ' + clr('bCyan', `Switching accounts in ${accDelay}s...`));
                     await sleep(accDelay * 1000);
                     await this.closeBrowser();
                 }
-                
-                // Reset failure counter on success
                 this.failedAttempts = 0;
-                
             } catch (error) {
                 console.log(ts() + ' ❌ ' + clr('bRed', `Error with account ${account.address.slice(0,10)}: ${error.message}`));
                 this.failedAttempts++;
-                
-                // If too many failures, restart browser
                 if (this.failedAttempts >= this.maxFailures) {
                     console.log(ts() + ' 🔄 ' + clr('bYellow', 'Too many failures, restarting browser...'));
                     await this.closeBrowser();
@@ -555,35 +651,21 @@ class LoquaBot {
     async run() {
         console.clear();
         printBanner();
-        
         this.accounts = loadAccounts();
-        if (!this.accounts.length) { 
-            console.error('❌ No accounts'); 
-            process.exit(1); 
-        }
-        
+        if (!this.accounts.length) { console.error('❌ No accounts'); process.exit(1); }
         console.log(ts() + ' 🚀 ' + clr('bGreen', `Starting with ${this.accounts.length} accounts...`));
-        console.log(ts() + ' 🔧 ' + clr('bCyan', 'CORS bypass enabled for Sui fullnode API'));
-        
         this.running = true;
-        
         while (this.running) {
-            try {
-                await this.runCycle();
-            } catch (error) {
+            try { await this.runCycle(); } catch (error) {
                 console.log(ts() + ' ❌ ' + clr('bRed', `Cycle error: ${error.message}`));
-                // Close browser on error to clean up
                 await this.closeBrowser();
                 await sleep(30000);
             }
-            
             if (!this.running) break;
-            
             const hours = CONFIG.sleepAfterCycleSeconds / 3600;
             console.log(ts() + ' 💤 ' + clr('bMagenta', `Sleeping for ${CONFIG.sleepAfterCycleSeconds}s (${hours.toFixed(1)} hours)...`));
             await sleep(CONFIG.sleepAfterCycleSeconds * 1000);
         }
-        
         await this.closeBrowser();
         console.log(ts() + ' 👋 ' + clr('bYellow', 'Bot stopped'));
     }
@@ -595,31 +677,18 @@ class LoquaBot {
     }
 }
 
-// Main execution
 const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-
 console.log(clr('bYellow', 'Use proxy?'));
 console.log('  1: ' + clr('bGreen', 'No (direct connection)'));
 console.log('  2: ' + clr('bGreen', 'Yes (use proxies from proxy.txt)'));
-console.log('');
-console.log(clr('bCyan', 'Note: CORS bypass is enabled for Sui fullnode API'));
-
 rl.question(clr('bCyan', '> '), (answer) => {
     const useProxy = answer.trim() === '2';
     rl.close();
-    
     const bot = new LoquaBot(useProxy);
     bot.run().catch(console.error);
-    
     process.on('SIGINT', () => {
         console.log('\n' + clr('bRed', '🛑 Stopping bot...'));
         bot.stop();
         process.exit(0);
-    });
-    
-    process.on('uncaughtException', (error) => {
-        console.log('\n' + clr('bRed', `Uncaught exception: ${error.message}`));
-        bot.stop();
-        process.exit(1);
     });
 });
